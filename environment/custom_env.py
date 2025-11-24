@@ -75,94 +75,106 @@ class MuseumGuideEnv(gym.Env):
         
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        
+    
         # Reset agent position to entry
         self.agent_pos = np.array(self.entry_pos, dtype=np.int32)
-        
+    
         # Initialize visitor profile randomly
-        self.visitor_engagement = 0.7
+        self.visitor_engagement = 0.8  # Start higher: 0.8 instead of 0.7
         self.language_pref = self.np_random.integers(0, 3)
         self.time_spent = 0
         self.artifacts_viewed = np.zeros(20, dtype=np.int8)
-        
-        # Random interest profile (preference for each category)
+    
+        # Random interest profile
         self.interest_vector = self.np_random.random(3).astype(np.float32)
-        self.interest_vector /= self.interest_vector.sum()  # Normalize
-        
-        # Initialize crowding (simulated dynamic environment)
-        self.crowding = self.np_random.random((self.grid_size, self.grid_size)).astype(np.float32) * 0.5
-        
-        self.current_language = 0  # Start with English
+        self.interest_vector /= self.interest_vector.sum()
+    
+        # Initialize crowding (LESS crowded overall)
+        self.crowding = self.np_random.random((self.grid_size, self.grid_size)).astype(np.float32) * 0.3  # Was 0.5
+    
+        self.current_language = 0
         self.steps = 0
-        self.max_steps = 100
-        
+        self.max_steps = 300  # Increased from 100
+    
         observation = self._get_obs()
         info = self._get_info()
-        
+    
         return observation, info
     
     def step(self, action):
         self.steps += 1
-        self.time_spent += 1  # Each step = 1 minute
-        
+        self.time_spent += 1
+    
         reward = 0
         terminated = False
-        
+    
         # Process action
         if action in [0, 1, 2, 3]:  # Movement actions
-            reward += self._move_agent(action)
+           reward += self._move_agent(action)
         elif action in [4, 5, 6]:  # Recommend artifact by category
-            reward += self._recommend_artifact(action - 4)
+           reward += self._recommend_artifact(action - 4)
         elif action == 7:  # Provide detailed info
-            reward += self._provide_info()
+           reward += self._provide_info()
         elif action == 8:  # Switch to Kinyarwanda
-            reward += self._switch_language(1)
+           reward += self._switch_language(1)
         elif action == 9:  # Switch to English
-            reward += self._switch_language(0)
+           reward += self._switch_language(0)
         elif action == 10:  # Suggest rest
-            reward += self._suggest_rest()
+           reward += self._suggest_rest()
         elif action == 11:  # End tour
             terminated = True
-            reward += self._end_tour_reward()
-        
-        # Update engagement (decays over time if not engaged)
+            if self.steps < 30:  # Penalize ending tour too early
+               reward += -20
+            else:
+               reward += self._end_tour_reward()
+    
+        # Update engagement (decays over time)
         self._update_engagement()
-        
+    
         # Check terminal conditions
         if self.visitor_engagement < 0.2:
-            terminated = True
-            reward -= 20  # Penalty for visitor leaving due to low engagement
-        
-        if self.time_spent >= 60:
-            terminated = True
-            reward += 10 if self.visitor_engagement > 0.6 else -10
-        
+           terminated = True
+           reward -= 10  # Reduced from -20
+    
+        if self.time_spent >= 200:  # Increased from 60
+           terminated = True
+           reward += 15 if self.visitor_engagement > 0.6 else -5
+    
         if self.steps >= self.max_steps:
-            terminated = True
-        
+           terminated = True
+    
         observation = self._get_obs()
         info = self._get_info()
-        
+    
         return observation, reward, terminated, False, info
     
     def _move_agent(self, direction):
         """Move agent in grid: 0=North, 1=South, 2=East, 3=West"""
         new_pos = self.agent_pos.copy()
-        
+    
         if direction == 0 and self.agent_pos[1] > 0:  # North
-            new_pos[1] -= 1
+           new_pos[1] -= 1
         elif direction == 1 and self.agent_pos[1] < self.grid_size - 1:  # South
-            new_pos[1] += 1
+           new_pos[1] += 1
         elif direction == 2 and self.agent_pos[0] < self.grid_size - 1:  # East
-            new_pos[0] += 1
+           new_pos[0] += 1
         elif direction == 3 and self.agent_pos[0] > 0:  # West
-            new_pos[0] -= 1
-        
-        # Check crowding penalty
+           new_pos[0] -= 1
+        else:
+           # Invalid move (hit wall)
+           return -1
+    
+        # Check crowding penalty (MUCH SMALLER NOW)
         crowd_level = self.crowding[new_pos[0], new_pos[1]]
-        reward = -15 if crowd_level > 0.7 else 0
-        
+        reward = -3 if crowd_level > 0.7 else -0.1  # Small step penalty
+    
         self.agent_pos = new_pos
+    
+        # Bonus for reaching an exhibit
+        at_exhibit = self._check_exhibit_proximity()
+        if at_exhibit is not None and self.artifacts_viewed[at_exhibit] == 0:
+           reward += 2  # Encourage exploration
+    
         return reward
     
     def _recommend_artifact(self, category):
@@ -229,7 +241,8 @@ class MuseumGuideEnv(gym.Env):
     
     def _update_engagement(self):
         """Update visitor engagement (natural decay)"""
-        self.visitor_engagement = max(0.0, self.visitor_engagement - 0.01)
+        # MUCH SLOWER decay: 0.003 instead of 0.01
+        self.visitor_engagement = max(0.0, self.visitor_engagement - 0.003)
     
     def _check_exhibit_proximity(self):
         """Check if agent is at an exhibit"""
