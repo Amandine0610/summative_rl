@@ -2,7 +2,8 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import pygame
-from typing import Tuple, Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+from .rendering import Renderer
 
 class MuseumGuideEnv(gym.Env):
     """
@@ -24,17 +25,22 @@ class MuseumGuideEnv(gym.Env):
         
         self.grid_size = grid_size
         self.render_mode = render_mode
+        self.max_steps = 300 # Define max steps as an instance variable
         
         # Define action space: 12 discrete actions
         self.action_space = spaces.Discrete(12)
         
         # Define observation space
         self.observation_space = spaces.Dict({
-            'agent_pos': spaces.Box(low=0, high=grid_size-1, shape=(2,), dtype=np.int32),
+            # Normalized to [0, 1] in _get_obs
+            'agent_pos': spaces.Box(low=0.0, high=1.0, shape=(2,), dtype=np.float32), 
             'visitor_engagement': spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
-            'language_pref': spaces.Discrete(3),  # 0=English, 1=Kinyarwanda, 2=Both
-            'time_spent': spaces.Box(low=0, high=60, shape=(1,), dtype=np.int32),
-            'artifacts_viewed': spaces.MultiBinary(20),  # 20 possible artifacts
+            # Cast to float32 in _get_obs
+            'language_pref': spaces.Box(low=0.0, high=2.0, shape=(1,), dtype=np.float32), 
+            # Normalized to [0, 1] in _get_obs
+            'time_spent': spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32), 
+            # Cast to float32 in _get_obs
+            'artifacts_viewed': spaces.Box(low=0.0, high=1.0, shape=(20,), dtype=np.float32), 
             'interest_vector': spaces.Box(low=0.0, high=1.0, shape=(3,), dtype=np.float32),
             'crowding': spaces.Box(low=0.0, high=1.0, shape=(grid_size, grid_size), dtype=np.float32)
         })
@@ -46,9 +52,11 @@ class MuseumGuideEnv(gym.Env):
         self.window = None
         self.clock = None
         self.cell_size = 60
-        
+        self.lang_switched = False
+        self.renderer = Renderer(grid_size, self.cell_size, self.metadata['render_fps'])
     def _init_exhibits(self):
         """Initialize museum exhibit locations and properties"""
+        # Only 9 actual exhibits, but artifacts_viewed array size is 20
         self.exhibits = {
             # Cultural exhibits
             0: {'pos': (2, 2), 'type': self.CULTURAL, 'name': 'Traditional Imigongo Art'},
@@ -66,6 +74,9 @@ class MuseumGuideEnv(gym.Env):
             8: {'pos': (6, 3), 'type': self.ARTISTIC, 'name': 'Photography Exhibition'}
         }
         
+        # Store artifact positions as a list for easy access in helper function
+        self.artifact_positions = [v['pos'] for v in self.exhibits.values()]
+        
         # Rest areas
         self.rest_areas = [(0, 5), (9, 5)]
         
@@ -78,23 +89,23 @@ class MuseumGuideEnv(gym.Env):
     
         # Reset agent position to entry
         self.agent_pos = np.array(self.entry_pos, dtype=np.int32)
-    
+        self.lang_switched = False
+
         # Initialize visitor profile randomly
-        self.visitor_engagement = 0.8  # Start higher: 0.8 instead of 0.7
+        self.visitor_engagement = 0.8
         self.language_pref = self.np_random.integers(0, 3)
         self.time_spent = 0
-        self.artifacts_viewed = np.zeros(20, dtype=np.int8)
+        self.artifacts_viewed = np.zeros(20, dtype=np.float32) # Changed to float32
     
         # Random interest profile
         self.interest_vector = self.np_random.random(3).astype(np.float32)
         self.interest_vector /= self.interest_vector.sum()
     
         # Initialize crowding (LESS crowded overall)
-        self.crowding = self.np_random.random((self.grid_size, self.grid_size)).astype(np.float32) * 0.3  # Was 0.5
+        self.crowding = self.np_random.random((self.grid_size, self.grid_size)).astype(np.float32) * 0.3 
     
         self.current_language = 0
         self.steps = 0
-        self.max_steps = 300  # Increased from 100
     
         observation = self._get_obs()
         info = self._get_info()
@@ -134,9 +145,9 @@ class MuseumGuideEnv(gym.Env):
         # Check terminal conditions
         if self.visitor_engagement < 0.2:
            terminated = True
-           reward -= 10  # Reduced from -20
+           reward -= 10 
     
-        if self.time_spent >= 200:  # Increased from 60
+        if self.time_spent >= 200:  
            terminated = True
            reward += 15 if self.visitor_engagement > 0.6 else -5
     
@@ -147,10 +158,33 @@ class MuseumGuideEnv(gym.Env):
         info = self._get_info()
     
         return observation, reward, terminated, False, info
+
+    def _min_distance_to_unviewed_artifact(self):
+        """Calculates the Manhattan distance to the closest unviewed artifact."""
+        
+        # Only check the first 9 artifact indices
+        unviewed_indices = np.where(self.artifacts_viewed[:9] == 0)[0]
+        
+        if len(unviewed_indices) == 0:
+            return 0  # No goals left
+        
+        min_dist = float('inf')
+        current_pos = self.agent_pos
+        
+        for i in unviewed_indices:
+            artifact_pos = self.artifact_positions[i]
+            # Manhattan distance (L1 norm)
+            dist = np.sum(np.abs(current_pos - artifact_pos))
+            if dist < min_dist:
+                min_dist = dist
+        return min_dist
     
     def _move_agent(self, direction):
         """Move agent in grid: 0=North, 1=South, 2=East, 3=West"""
         new_pos = self.agent_pos.copy()
+        
+        # 1. Get distance BEFORE move (for reward shaping)
+        old_dist = self._min_distance_to_unviewed_artifact()
     
         if direction == 0 and self.agent_pos[1] > 0:  # North
            new_pos[1] -= 1
@@ -164,17 +198,28 @@ class MuseumGuideEnv(gym.Env):
            # Invalid move (hit wall)
            return -1
     
-        # Check crowding penalty (MUCH SMALLER NOW)
+        # Check crowding penalty 
         crowd_level = self.crowding[new_pos[0], new_pos[1]]
         reward = -3 if crowd_level > 0.7 else -0.1  # Small step penalty
     
         self.agent_pos = new_pos
-    
+        
+        # 2. Get distance AFTER move
+        new_dist = self._min_distance_to_unviewed_artifact()
+        
+        # 3. Reward Shaping: Encourage progress toward the nearest goal
+        progress = old_dist - new_dist
+        # A positive progress means the agent moved closer.
+        # This small, dense reward guides the agent's movement.
+        reward += progress * 0.5 
+        
         # Bonus for reaching an exhibit
         at_exhibit = self._check_exhibit_proximity()
         if at_exhibit is not None and self.artifacts_viewed[at_exhibit] == 0:
-           reward += 2  # Encourage exploration
-    
+           # Make the main reward for finding an exhibit substantial
+           reward += 5 
+           self.artifacts_viewed[at_exhibit] = 1.0 # Set to 1.0 (float)
+
         return reward
     
     def _recommend_artifact(self, category):
@@ -188,12 +233,16 @@ class MuseumGuideEnv(gym.Env):
             # Reward based on interest match
             if exhibit['type'] == category:
                 interest_score = self.interest_vector[category]
-                self.artifacts_viewed[at_exhibit] = 1
                 
-                # Higher reward for good match
-                reward = 10 + (interest_score * 10)
-                self.visitor_engagement = min(1.0, self.visitor_engagement + 0.1)
-                return reward
+                # Only give reward if already viewed by agent (to prevent double-counting)
+                # The _move_agent function now sets the artifact to viewed.
+                if self.artifacts_viewed[at_exhibit] == 1.0:
+                    reward = 10 + (interest_score * 10)
+                    self.visitor_engagement = min(1.0, self.visitor_engagement + 0.1)
+                    return reward
+                else:
+                    # Agent is at the location but hasn't "viewed" it yet (bug fix: should not happen if _move_agent is working)
+                    return 0
             else:
                 # Penalty for poor recommendation
                 self.visitor_engagement = max(0.0, self.visitor_engagement - 0.05)
@@ -205,7 +254,7 @@ class MuseumGuideEnv(gym.Env):
         """Provide detailed information"""
         at_exhibit = self._check_exhibit_proximity()
         
-        if at_exhibit is not None and self.artifacts_viewed[at_exhibit] == 1:
+        if at_exhibit is not None and self.artifacts_viewed[at_exhibit] == 1.0: # Check as float
             # Bonus for using correct language
             lang_bonus = 5 if self.current_language == self.language_pref or self.language_pref == 2 else 0
             self.visitor_engagement = min(1.0, self.visitor_engagement + 0.15)
@@ -216,8 +265,13 @@ class MuseumGuideEnv(gym.Env):
     def _switch_language(self, lang):
         """Switch language: 0=English, 1=Kinyarwanda"""
         self.current_language = lang
-        if lang == self.language_pref or self.language_pref == 2:
+        match = (lang == self.language_pref or self.language_pref == 2)
+        if match:
+           if not self.lang_switched:  # NEW: Bonus only once
+            self.lang_switched = True
             return 5
+        else:
+            return 0  # No spam
         return -3
     
     def _suggest_rest(self):
@@ -230,7 +284,7 @@ class MuseumGuideEnv(gym.Env):
     
     def _end_tour_reward(self):
         """Calculate reward for ending tour"""
-        artifacts_count = self.artifacts_viewed.sum()
+        artifacts_count = int(self.artifacts_viewed.sum())
         
         if artifacts_count >= 5 and self.visitor_engagement > 0.6:
             return 20
@@ -241,7 +295,7 @@ class MuseumGuideEnv(gym.Env):
     
     def _update_engagement(self):
         """Update visitor engagement (natural decay)"""
-        # MUCH SLOWER decay: 0.003 instead of 0.01
+        # MUCH SLOWER decay: 0.003
         self.visitor_engagement = max(0.0, self.visitor_engagement - 0.003)
     
     def _check_exhibit_proximity(self):
@@ -252,11 +306,21 @@ class MuseumGuideEnv(gym.Env):
         return None
     
     def _get_obs(self):
+        """Returns the current observation dictionary with NORMALIZED values."""
+        
+        GRID_MAX = self.grid_size - 1  # 9
+        TIME_MAX = self.max_steps     # 300 
+        
         return {
-            'agent_pos': self.agent_pos,
-            'visitor_engagement': np.array([self.visitor_engagement], dtype=np.float32),
-            'language_pref': self.language_pref,
-            'time_spent': np.array([self.time_spent], dtype=np.int32),
+            # Normalize agent position (0-9) to [0, 1]
+            'agent_pos': self.agent_pos.astype(np.float32) / GRID_MAX,
+            # Already normalized
+            'visitor_engagement': np.array([self.visitor_engagement], dtype=np.float32), 
+            # Cast to float32
+            'language_pref': np.array([self.language_pref]).astype(np.float32), 
+            # Normalize time spent (0-300) to [0, 1]
+            'time_spent': np.array([self.time_spent], dtype=np.float32) / TIME_MAX,
+            # Already 0 or 1, but ensure float32
             'artifacts_viewed': self.artifacts_viewed,
             'interest_vector': self.interest_vector,
             'crowding': self.crowding
@@ -266,15 +330,18 @@ class MuseumGuideEnv(gym.Env):
         return {
             'artifacts_viewed_count': int(self.artifacts_viewed.sum()),
             'engagement_level': float(self.visitor_engagement),
-            'time_remaining': 60 - self.time_spent
+            'time_remaining': self.max_steps - self.time_spent
         }
     
     def render(self):
         if self.render_mode == 'human':
-            return self._render_pygame()
+            canvas = pygame.Surface((self.grid_size * self.cell_size, self.grid_size * self.cell_size + 100))
+            self.renderer.render_human(canvas, self.crowding, self.exhibits, self.artifacts_viewed, self.rest_areas, self.entry_pos, self.exit_pos, self.agent_pos, self.visitor_engagement, self.time_spent, int(self.artifacts_viewed.sum()), self.current_language)
+            self.renderer.window.blit(canvas, (0, 0))
+            # ... existing pump/update/clock ...
         elif self.render_mode == 'rgb_array':
-            return self._render_rgb_array()
-    
+            return self.renderer.render_rgb_array(self.crowding, self.exhibits, self.artifacts_viewed, self.rest_areas, self.entry_pos, self.exit_pos, self.agent_pos, self.visitor_engagement, self.time_spent, int(self.artifacts_viewed.sum()), self.current_language)
+        
     def _render_pygame(self):
         """Render using pygame"""
         if self.window is None:
@@ -319,8 +386,8 @@ class MuseumGuideEnv(gym.Env):
             
             pygame.draw.circle(canvas, color, center, self.cell_size // 3)
             
-            # Mark if viewed
-            if self.artifacts_viewed[exhibit_id]:
+            # Mark if viewed (check as boolean/float 1.0)
+            if self.artifacts_viewed[exhibit_id] > 0.5: 
                 pygame.draw.circle(canvas, (0, 255, 0), center, self.cell_size // 6)
         
         # Draw rest areas
@@ -350,7 +417,7 @@ class MuseumGuideEnv(gym.Env):
         font = pygame.font.Font(None, 24)
         texts = [
             f"Engagement: {self.visitor_engagement:.2f}",
-            f"Time: {self.time_spent}/60 min",
+            f"Time: {self.time_spent}/{self.max_steps} steps",
             f"Artifacts: {self.artifacts_viewed.sum()}/9",
             f"Language: {'EN' if self.current_language == 0 else 'RW'}"
         ]
@@ -370,3 +437,4 @@ class MuseumGuideEnv(gym.Env):
             pygame.quit()
             self.window = None
             self.clock = None
+            self.renderer.close()
